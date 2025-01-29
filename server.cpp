@@ -70,7 +70,7 @@ static int32_t one_request(int conn_fd) {
     // request body
     err = read_full(conn_fd, &rbuf[4], len);
     if (err) {
-        msg(errno == 0 ? "EOF" : "read() error");
+        msg("read() error");
         return err;
     }
 

@@ -83,7 +83,7 @@ static int32_t query(int fd, const char* text) {
     // reply body
     err = read_full(fd, &rbuf[4], len);
     if (err) {
-        msg(errno == 0 ? "EOF" : "read() error");
+        msg("read() error");
         return err;
     }
 
