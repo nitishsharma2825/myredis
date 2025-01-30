@@ -21,7 +21,7 @@ static void die(const char* msg) {
     abort();
 }
 
-const size_t k_max_msg = 4096;
+const size_t k_max_msg = 32 << 20; // likely larger than the kernel buffer
 
 static int32_t read_full(int fd, uint8_t* buf, size_t n) {
     while (n > 0) {

@@ -70,6 +70,7 @@ static void buf_consume(std::vector<uint8_t>& buf, size_t len) {
     buf.erase(buf.begin(), buf.begin() + len);
 }
 
+// application callback when the listening socket is ready
 static Conn* handle_accept(int fd) {
     // accept
     struct sockaddr_in client_addr = {};
@@ -125,6 +126,7 @@ static bool try_one_request(Conn* conn) {
     buf_append(conn->outgoing, request, len);
 
     // application logic done! remove the request message
+    // conn->incoming.clear(); // wrong!
     buf_consume(conn->incoming, 4 + len);
     // Q. Why not just empty the buffer? See the explanation of "pipelining"
     return true; // success
@@ -186,6 +188,7 @@ static void handle_read(Conn* conn) {
     buf_append(conn->incoming, buf, (size_t)rv);
 
     // parse requests and generate responses
+    // try_one_request(conn); wrong!
     while (try_one_request(conn)) {}
     // Why calling this in a loop? See the explanation of "pipelining"
 
