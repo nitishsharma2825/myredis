@@ -36,7 +36,7 @@ static void fd_set_nb(int fd) {
     errno = 0;
     int flags = fcntl(fd, F_GETFL, 0);
     if(errno) {
-        die("fctnl error");
+        die("fcntl error");
         return;
     }
 
@@ -49,7 +49,7 @@ static void fd_set_nb(int fd) {
     }    
 }
 
-const size_t k_max_msg = 4096;
+const size_t k_max_msg = 32 << 20; // likely larger than the kernel buffer
 
 struct Conn {
     int fd = -1;
@@ -98,6 +98,8 @@ static Conn* handle_accept(int fd) {
     return conn;
 }
 
+const size_t k_max_args = 200 * 1000;
+
 static bool read_u32(const uint8_t* &cur, const uint8_t* end, uint32_t& out) {
     if (cur + 4 > end) {
         return false;
@@ -126,13 +128,13 @@ static int32_t parse_req(const uint8_t* data, size_t size, std::vector<std::stri
     if (!read_u32(data, end, nstr)){
         return -1;
     }
-    if (nstr > k_max_msg){
+    if (nstr > k_max_args){
         return -1; // safety limit
     }
 
     while (out.size() < nstr) {
         uint32_t len = 0;
-        if (read_u32(data, end, len)) {
+        if (!read_u32(data, end, len)) {
             return -1;
         }
         out.push_back(std::string());
@@ -150,7 +152,7 @@ static int32_t parse_req(const uint8_t* data, size_t size, std::vector<std::stri
 enum {
     RES_OK = 0,
     RES_ERR = 1, // error
-    RES_NX = 2,  // not found
+    RES_NX = 2,  // key not found
 };
 
 // +--------+---------+
@@ -231,7 +233,7 @@ static bool try_one_request(Conn* conn) {
 // application callback when the socket is writable
 static void handle_write(Conn* conn) {
     assert(conn->outgoing.size() > 0);
-    ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+    ssize_t rv = write(conn->fd, &conn->outgoing[0], conn->outgoing.size());
     if (rv < 0 && errno == EAGAIN) {
         return; // EAGAIN means actually not ready
     }
@@ -324,7 +326,7 @@ int main() {
 
     // listen for incoming connections
     rv = listen(fd, SOMAXCONN);
-    if (rv < 0) {
+    if (rv) {
         die("listen()");
     }
 
@@ -360,7 +362,7 @@ int main() {
 
         // wait for readiness
         int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), -1);
-        if (rv < 0 && errno != EINTR) {
+        if (rv < 0 && errno == EINTR) {
             continue;
         }
         if (rv < 0) {
