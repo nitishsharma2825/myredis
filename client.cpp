@@ -254,4 +254,4 @@ L_DONE:
 
 
 
-// g++ -Wall -Wextra -O2 -g server.cpp hashtable.cpp -o server
+// g++ -Wall -Wextra -O2 -g zset.cpp avl.cpp hashtable.cpp server.cpp -o server
