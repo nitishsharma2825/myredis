@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <math.h>
 // system
+#include <time.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
@@ -23,6 +24,7 @@
 #include "zset.h"
 #include "common.h"
 #include "list.h"
+#include "heap.h"
 
 static void msg(const char* msg) {
     fprintf(stderr, "%s\n", msg);
@@ -95,23 +97,26 @@ static struct {
     std::vector<Conn*> fd2conn;
     // timers for idle connections
     DList idle_list;
+    // timer for TTLs
+    std::vector<HeapItem> heap;
 } g_data;
 
 // application callback when the listening socket is ready
-static Conn* handle_accept(int fd) {
+static size_t handle_accept(int fd) {
     // accept
     struct sockaddr_in client_addr = {};
     socklen_t socklen = sizeof(client_addr);
     int conn_fd = accept(fd, (struct sockaddr*)&client_addr, &socklen);
     if (conn_fd < 0) {
         msg_errno("accept() error");
-        return NULL;
+        return -1;
     }
 
     uint32_t ip = client_addr.sin_addr.s_addr;
     fprintf(stderr, "new client from %u.%u.%u.%u:%u\n",
-            (ip >> 0) & 255, (ip >> 8) & 255, (ip >> 16) & 255, (ip >> 24) & 255,
-            ntohs(client_addr.sin_port));
+        ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
+        ntohs(client_addr.sin_port)
+    );
     
     // set the new connection fd to non blocking mode
     fd_set_nb(conn_fd);
@@ -280,6 +285,8 @@ enum {
 struct Entry {
     struct HNode node;  // hashtable node
     std::string key;
+    // for TTL
+    size_t heap_idx = -1;   // array index to the heap item
     // value
     uint32_t type = 0;
     // one of the following
@@ -293,10 +300,13 @@ static Entry* entry_new(uint32_t type) {
     return ent;
 }
 
-static Entry* entry_del(Entry* ent) {
+static void entry_set_ttl(Entry* ent, int64_t ttl_ms);
+
+static void entry_del(Entry* ent) {
     if (ent->type == T_ZSET) {
         zset_clear(&ent->zset);
     }
+    entry_set_ttl(ent, -1);     // remove from the heap data structure
     delete ent;
 }
 
@@ -368,6 +378,86 @@ static void do_del(std::vector<std::string> &cmd, Buffer &out) {
     return out_int(out, node ? 1 : 0);
 }
 
+static void heap_delete(std::vector<HeapItem> &a, size_t pos) {
+    // swap the erased item with the last item
+    a[pos] = a.back();
+    a.pop_back();
+    // update the swapped item
+    if (pos < a.size()) {
+        heap_update(a.data(), pos, a.size());
+    }
+}
+
+static void heap_upsert(std::vector<HeapItem> &a, size_t pos, HeapItem t) {
+    if (pos < a.size()) {
+        a[pos] = t; // update an existing item
+    } else {
+        pos = a.size();
+        a.push_back(t);     // add a new item
+    }
+    heap_update(a.data(), pos, a.size());
+}
+
+// set or remove the TTL
+static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
+    if (ttl_ms < 0 && ent->heap_idx != (size_t)-1) {
+        // setting a negative TTL means removing the TTL
+        heap_delete(g_data.heap, ent->heap_idx);
+        ent->heap_idx = -1;
+    } else if (ttl_ms >= 0) {
+        // add or update the heap data structure
+        uint64_t expire_at = get_monotonic_msec() + (uint64_t)ttl_ms;
+        HeapItem item = {expire_at, &ent->heap_idx};
+        heap_upsert(g_data.heap, ent->heap_idx, item);
+    }
+}
+
+static bool str2int(const std::string &s, int64_t &out) {
+    char* endp = NULL;
+    out = strtoll(s.c_str(), &endp, 10);
+    return endp == s.c_str() + s.size();
+}
+
+// PEXPIRE key ttl_ms : set TTL for the key
+static void do_expire(std::vector<std::string> &cmd, Buffer &out) {
+    int64_t ttl_ms = 0;
+    if (!str2int(cmd[2], ttl_ms)) {
+        return out_err(out, ERR_BAD_ARG, "expect int64");
+    }
+
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (node) {
+        Entry *ent = container_of(node, Entry, node);
+        entry_set_ttl(ent, ttl_ms);
+    }
+    return out_int(out, node ? 1: 0);
+}
+
+// PTTL key : get TTL for the key
+static void do_ttl(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
+
+    HNode* node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) {
+        return out_int(out, -2);    // not found
+    }
+
+    Entry* ent = container_of(node, Entry, node);
+    if (ent->heap_idx == (size_t)-1) {
+        return out_int(out, -1);    // no TTL
+    }
+
+    uint64_t expire_at = g_data.heap[ent->heap_idx].val;
+    uint64_t now_ms = get_monotonic_msec();
+    return out_int(out, expire_at > now_ms ? (expire_at - now_ms) : 0);
+}
+
 static bool cb_keys(HNode *node, void *arg) {
     Buffer &out = *(Buffer*)arg;
     const std::string &key = container_of(node, Entry, node)->key;
@@ -384,13 +474,6 @@ static bool str2dbl(const std::string &s, double &out) {
     char* endp = NULL;
     out = strtod(s.c_str(), &endp);
     return endp == s.c_str() + s.size() && !isnan(out);
-}
-
-
-static bool str2int(const std::string &s, int64_t &out) {
-    char* endp = NULL;
-    out = strtoll(s.c_str(), &endp, 10);
-    return endp == s.c_str() + s.size();
 }
 
 // zadd zset score name
@@ -511,6 +594,10 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
         return do_set(cmd, out);
     } else if (cmd.size() == 2 && cmd[0] == "del") {
         return do_del(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "pexpire") {
+        return do_expire(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "pttl") {
+        return do_ttl(cmd, out);
     } else if (cmd.size() == 1 && cmd[0] == "keys") {
         return do_keys(cmd, out);
     } else if (cmd.size() == 4 && cmd[0] == "zadd") {
@@ -659,22 +746,35 @@ static void handle_read(Conn* conn) {
 
 const uint64_t k_idle_timeout_ms = 5 * 1000;
 
-static int32_t next_timer_ms() {
-    if (dlist_empty(&g_data.idle_list)) {
-        return -1;  // no timers, no timeout
-    }
-
+static uint32_t next_timer_ms() {
     uint64_t now_ms = get_monotonic_msec();
-    Conn* conn = container_of(g_data.idle_list.next, Conn, idle_node);
-    uint64_t next_ms = conn->last_active_ms + k_idle_timeout_ms;
+    uint64_t next_ms = (uint64_t)-1;
+    // idle timers using a linked list
+    if (!dlist_empty(&g_data.idle_list)) {
+        Conn* conn = container_of(g_data.idle_list.next, Conn, idle_node);
+        next_ms = conn->last_active_ms + k_idle_timeout_ms;
+    }
+    // TTL timers using a heap
+    if (!g_data.heap.empty() && g_data.heap[0].val < next_ms) {
+        next_ms = g_data.heap[0].val;
+    }
+    // timeout val
+    if (next_ms == (uint64_t)-1) {
+        return -1;  // no timers, no timeouts
+    }
     if (next_ms <= now_ms) {
         return 0;   // missed?
     }
     return (int32_t)(next_ms - now_ms);
 }
 
+static bool hnode_same (HNode* node, HNode* key) {
+    return node == key;
+}
+
 static void process_timers() {
     uint64_t now_ms = get_monotonic_msec();
+    // idle timers using a linked list
     while (!dlist_empty(&g_data.idle_list)) {
         Conn* conn = container_of(g_data.idle_list.next, Conn, idle_node);
         uint64_t next_ms = conn->last_active_ms + k_idle_timeout_ms;
@@ -685,13 +785,28 @@ static void process_timers() {
         fprintf(stderr, "removing idle connection: %d\n", conn->fd);
         conn_destroy(conn);
     }
+    // TTL timers using a heap
+    const size_t k_max_works = 2000;
+    size_t nworks = 0;
+    const std::vector<HeapItem> &heap = g_data.heap;
+    while (!heap.empty() && heap[0].val < now_ms) {
+        Entry* ent = container_of(heap[0].ref, Entry, heap_idx);
+        HNode* node = hm_delete(&g_data.db, &ent->node, &hnode_same);
+        // fprintf(stderr, "key expired: %s\n", ent->key.c_str());
+        // delete the key
+        entry_del(ent);
+        if (nworks++ >= k_max_works) {
+            // don't stall the server if too many keys are expiring at once
+            break;
+        }
+    }
 }
 
 int main() {
     // initialisation
     dlist_init(&g_data.idle_list);
 
-    // Create a socket
+    // Create a listening socket
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         die("socket()");
@@ -764,7 +879,7 @@ int main() {
         }
 
         // handle connection sockets
-        for (size_t i = 1; i < poll_args.size(); ++i) {
+        for (size_t i = 1; i < poll_args.size(); ++i) { // note: skip the first
             uint32_t ready = poll_args[i].revents;
             if (ready == 0) {
                 continue;

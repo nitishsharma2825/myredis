@@ -30,8 +30,8 @@ static void heap_down(HeapItem* a, size_t pos, size_t len) {
         // find the smallest one among the parent and their kids
         size_t l = heap_left(pos);
         size_t r = heap_right(pos);
-        size_t min_pos = -1;
-        size_t min_val = t.val;
+        size_t min_pos = pos;
+        uint64_t min_val = t.val;
         if (l < len && a[l].val < min_val) {
             min_pos = l;
             min_val = a[l].val;
@@ -39,7 +39,7 @@ static void heap_down(HeapItem* a, size_t pos, size_t len) {
         if (r < len && a[r].val < min_val) {
             min_pos = r;
         }
-        if (min_pos == (size_t)-1) {
+        if (min_pos == pos) {
             break;
         }
         // swap with the kid
